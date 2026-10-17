@@ -1,0 +1,125 @@
+name: Merthansph Canli Yayin Ses Kaydedici
+
+on:
+  schedule:
+    # Türkiye saatiyle (UTC+3) her akşam 21:00'de (18:00 UTC) başlar ve gece 02:00'ye kadar nöbet tutar
+    - cron: '0 18 * * *'
+    # Türkiye saatiyle gece 00:30'da (21:30 UTC) ikinci vardiya (yayın gece yarısından sonra açılırsa sabaha kadar bekler)
+    - cron: '30 21 * * *'
+  workflow_dispatch: # İstenirse GitHub üzerinden tek tıkla manuel olarak da başlatılabilir
+
+# Aynı anda iki görevin çakışmasını önler; ilk görev yayını kaydediyorsa ikinci görev onu kesmez, sırasını bekler
+concurrency:
+  group: merthansph-live-recorder
+  cancel-in-progress: false
+
+jobs:
+  record-and-process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # GitHub maksimum 360 dk izin verir
+
+    steps:
+      - name: Gerekli Araclari Kur (yt-dlp, FFmpeg, auto-editor)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg python3-pip curl
+          pip3 install -U yt-dlp auto-editor
+
+      - name: Merthansph Canli Yayinini Bekle ve Sesi Kaydet
+        id: record
+        run: |
+          mkdir -p kayitlar
+          CHANNEL_URL="https://www.youtube.com/channel/UCpI4T5A9Fi5RhWMryonEhnQ/live"
+          TIMESTAMP=$(TZ="Europe/Istanbul" date +"%Y-%m-%d_%H-%M")
+          RAW_FILE="kayitlar/ham_${TIMESTAMP}.m4a"
+
+          echo "Merthansph kanalı canlı yayın için izleniyor (Başlangıç: $(TZ='Europe/Istanbul' date))..."
+
+          # 5 saat (18000 sn) boyunca her 60 saniyede bir canlı yayını kontrol et.
+          # Yayın başladığında ilk saniyesinden itibaren (--live-from-start) yalnızca sesi (-f ba) indir.
+          timeout 18000s yt-dlp \
+            --live-from-start \
+            --wait-for-video 60 \
+            --no-part \
+            -f "ba/b" \
+            -x --audio-format m4a \
+            -o "$RAW_FILE" \
+            "$CHANNEL_URL" || true
+
+          if [ -f "$RAW_FILE" ]; then
+            echo "recorded=true" >> $GITHUB_OUTPUT
+            echo "raw_file=$RAW_FILE" >> $GITHUB_OUTPUT
+            echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+            echo "Yayın başarıyla kaydedildi: $RAW_FILE"
+          else
+            echo "recorded=false" >> $GITHUB_OUTPUT
+            echo "Bu nöbet süresince canlı yayın açılmadı."
+          fi
+
+      - name: Sessiz Kisimlari Otomatik Kes ve Boyutu Kucult
+        if: steps.record.outputs.recorded == 'true'
+        id: process
+        run: |
+          RAW_FILE="${{ steps.record.outputs.raw_file }}"
+          TIMESTAMP="${{ steps.record.outputs.timestamp }}"
+          CLEAN_FILE="kayitlar/merthansph_${TIMESTAMP}_kesilmis.mp3"
+
+          echo "Sessiz kısımlar kesiliyor ve konuşma sesi sıkıştırılıyor..."
+
+          # auto-editor ile sessizlikleri (%4 eşik altı) kes, konuşma başı/sonuna 0.25sn doğal pay bırak
+          auto-editor "$RAW_FILE" \
+            --edit audio:threshold=4% \
+            --margin 0.25s \
+            --audio-codec libmp3lame \
+            --audio-bitrate 64k \
+            -o "$CLEAN_FILE" || {
+              echo "Alternatif FFmpeg sessizlik kesici devreye giriyor..."
+              ffmpeg -y -i "$RAW_FILE" \
+                -af "silenceremove=stop_periods=-1:stop_duration=0.6:stop_threshold=-35dB" \
+                -ac 1 -ar 44100 -b:a 64k "$CLEAN_FILE"
+            }
+
+          rm -f "$RAW_FILE"
+          echo "clean_file=$CLEAN_FILE" >> $GITHUB_OUTPUT
+
+      - name: Telegram'a Otomatik Gonder (Opsiyonel)
+        if: steps.record.outputs.recorded == 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          CLEAN_FILE="${{ steps.process.outputs.clean_file }}"
+          TIMESTAMP="${{ steps.record.outputs.timestamp }}"
+
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "Telegram bilgileri tanımlanmamış, dosya doğrudan GitHub sayfasından indirilebilir."
+            exit 0
+          fi
+
+          # Dosya 45 MB'dan büyükse Telegram bot sınırı (50MB) nedeniyle otomatik parçalara böl
+          FILE_SIZE=$(stat -c%s "$CLEAN_FILE")
+          MAX_SIZE=$((45 * 1024 * 1024))
+
+          if [ "$FILE_SIZE" -le "$MAX_SIZE" ]; then
+            curl -s -F chat_id="$CHAT_ID" \
+                 -F audio=@"$CLEAN_FILE" \
+                 -F caption="🎙️ Merthansph Canlı Yayın Kaydı ($TIMESTAMP) - Sessizlikler kesildi." \
+                 "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio"
+          else
+            echo "Dosya 45MB üzeri, parçalara bölünerek Telegram'a gönderiliyor..."
+            ffmpeg -i "$CLEAN_FILE" -f segment -segment_time 3600 -c copy "kayitlar/merthansph_${TIMESTAMP}_parca_%02d.mp3"
+            for PART in kayitlar/merthansph_${TIMESTAMP}_parca_*.mp3; do
+              curl -s -F chat_id="$CHAT_ID" \
+                   -F audio=@"$PART" \
+                   -F caption="🎙️ Merthansph Kaydı ($TIMESTAMP) - $(basename "$PART")" \
+                   "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio"
+            done
+          fi
+
+      - name: GitHub Uzerine Kaydet (Indirilebilir Arsiv)
+        if: steps.record.outputs.recorded == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: merthansph-yayin-${{ steps.record.outputs.timestamp }}
+          path: ${{ steps.process.outputs.clean_file }}
+          retention-days: 30
